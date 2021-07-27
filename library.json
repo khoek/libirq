@@ -1,6 +1,6 @@
 {
     "name": "libirq",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "description": "A library built on esp-idf for handling interrupt messages from IRQs in a non-polling manner.",
     "keywords": "isr, irq, async, task, esp-idf, esp32, esp8266",
     "repository": {
@@ -19,6 +19,7 @@
     "frameworks": "espidf",
     "platforms": "espressif32",
     "dependencies": {
-        "khoek/libesp": "^2.0.0"
+        "khoek/libesp": "^2.0.0",
+        "khoek/libtask": "^1.0.0"
     }
 }

@@ -2,143 +2,142 @@
 
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/event_groups.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <libesp.h>
 
 static const char* TAG = "libirq";
 
-struct irq_task {
-    // *** Read-only part ***
-    struct irq_task_ctrl {
-        // A copy of this pin number must be stored here for the ISR to access.
-        gpio_num_t pin_irq;
-        // Whether to trigger the ISR handler on a low pin level or high pin level.
-        bool trigger_high;
+#define IRQ_TASK_STACK_SIZE 2048
+#define IRQ_TASK_PRIORITY 15
 
-        // The external handler to invoke when the IRQ occurs.
-        handle_irq_fn_t handle_irq;
-        // The private data to pass to the handler.
-        void* private;
+struct libirq_source {
+    // A copy of this pin number must be stored here for the ISR to access.
+    gpio_num_t pin_irq;
+    // FIXME relocate this?
+    // Whether to trigger the ISR handler on a low pin level or high pin level.
+    bool trigger_high;
 
-        // Used (by the irq task only) to wait for a signal from the IRQ ISR.
-        SemaphoreHandle_t irq_sem;
-        // Used to protect the `irq_task_state` member, below.
-        SemaphoreHandle_t state_mutex;
-    } ctrl;
+    // Used to wait for a signal from the IRQ ISR, and to instruct the ISR
+    // setup/teardown task to stop.
+    EventGroupHandle_t events;
+#define IRQ_EVENT_GOT_IRQ (1ULL << 0)
+#define IRQ_EVENT_SHOULD_TEARDOWN (1ULL << 1)
+#define IRQ_EVENT_TEARDOWN_FINISHED (1ULL << 2)
 
-    // *** Read-write part, protected by `irq_task_ctrl.state_mutex` ***
-    struct irq_task_state {
-        // This member is initially set to `NULL`. In order to signal the
-        // irq task to terminate it is set to a nonnull value, and then
-        // once shutdown of the irq task has progressed sufficiently
-        // that it can be guarenteed that no further calls to `handle_irq()`
-        //  will be peformed, this semaphore is "given". It is then
-        // the responsibility of the task waiting on this semaphore to
-        // destory it.
-        SemaphoreHandle_t should_stop;
-    } state;
+    SemaphoreHandle_t refcount_lock;
+    uint32_t refcount;
 };
 
-typedef struct irq_task_ctrl irq_task_ctrl_t;
-typedef struct irq_task_state irq_task_state_t;
+static libirq_source_t* alloc_irq_source(gpio_num_t pin_irq, bool trigger_high) {
+    libirq_source_t* src = malloc(sizeof(libirq_source_t));
+    src->pin_irq = pin_irq;
+    src->trigger_high = trigger_high;
+    src->events = xEventGroupCreate();
 
-static irq_task_t* alloc_irq_task(gpio_num_t pin_irq, bool trigger_high, handle_irq_fn_t handle_irq, void* private) {
-    irq_task_ctrl_t ctrl = {
-        .pin_irq = pin_irq,
-        .trigger_high = trigger_high,
+    src->refcount_lock = xSemaphoreCreateMutex();
+    src->refcount = 1;
 
-        .handle_irq = handle_irq,
-        .private = private,
-
-        .irq_sem = xSemaphoreCreateBinary(),
-        .state_mutex = xSemaphoreCreateMutex(),
-    };
-
-    irq_task_state_t state = {
-        .should_stop = NULL,
-    };
-
-    irq_task_t* task = malloc(sizeof(irq_task_t));
-    task->ctrl = ctrl;
-    task->state = state;
-
-    return task;
+    return src;
 }
 
-static void free_irq_task(irq_task_t* task) {
-    vSemaphoreDelete(task->ctrl.irq_sem);
-    vSemaphoreDelete(task->ctrl.state_mutex);
+static void free_irq_source(libirq_source_t* src) {
+    vEventGroupDelete(src->events);
+    free(src);
+}
 
-    // Note that we do not free `task->state.should_stop`,
-    // since that is the responsibility of the waiting task
-    // (and it might not have woken yet).
+static void inc_refcount_irq_source(libirq_source_t* src) {
+    while (xSemaphoreTake(src->refcount_lock, portMAX_DELAY) != pdTRUE)
+        ;
 
-    free(task);
+    src->refcount++;
+    assert(src->refcount);
+
+    xSemaphoreGive(src->refcount_lock);
+}
+
+static void dec_refcount_irq_source(libirq_source_t* src) {
+    while (xSemaphoreTake(src->refcount_lock, portMAX_DELAY) != pdTRUE)
+        ;
+
+    src->refcount--;
+    bool should_free = !src->refcount;
+
+    xSemaphoreGive(src->refcount_lock);
+
+    if (should_free) {
+        free_irq_source(src);
+    }
 }
 
 static void isr_irq(void* arg) {
-    irq_task_t* task = arg;
+    libirq_source_t* src = arg;
 
     // First, since this interrupt is level-triggered (so we don't miss any) disable further
-    // interrupts. If the `irq_loop()` happens to enable this interrupt again asynchronously
-    // with this, we don't mind, since `sleep_until_irq_high()` clears spurious pending
+    // interrupts. If the waiting task happens to enable this interrupt again asynchronously
+    // with this, we don't mind, since `sleep_until_irq_active()` clears spurious pending
     // messages.
-    gpio_intr_disable(task->ctrl.pin_irq);
+    gpio_intr_disable(src->pin_irq);
 
     // Only now give the semaphore, which will ensure that the `irq_loop()` will always
     // eventually take the semaphore and call `gpio_intr_enable()` for us. (We don't care
     // about the return value, i.e. whether we were able to.)
-    xSemaphoreGiveFromISR(task->ctrl.irq_sem, NULL);
+    xEventGroupSetBits(src->events, IRQ_EVENT_GOT_IRQ);
 }
 
-static __always_inline void sleep_until_irq_high(const irq_task_t* task) {
-    // Clear a potential spurious message from the IRQ ISR.
-    xSemaphoreTake(task->ctrl.irq_sem, 0);
+// Returns `true` if the sleep ended because the IRQ became active,
+// else returns `false` if the sleep was interrupted by a call for the underlying IRQ source
+// to destroy itself.
+static bool sleep_until_irq_active(const libirq_source_t* src) {
+    // Clear a potential previous IRQ message from the IRQ ISR. Note that this call
+    // is safe to make even if other tasks are currently waiting on this bit.
+    //
+    // It is important that this bit is never cleared after a call to `gpio_intr_enable`(),
+    // e.g. upon its reciept below, because this can result in a race condition
+    // (as explained below).
+    xEventGroupClearBits(src->events, IRQ_EVENT_GOT_IRQ);
 
-    // If we are here, IRQ is low. First, enable the IRQ ISR. Since the ISR disables
-    // itself before it is possible to take `player->irq_sem`, a race condition cannot
-    // occur here.
-    gpio_intr_enable(task->ctrl.pin_irq);
+    // First, enable the IRQ ISR. This is safe to call if another task has already
+    // done this and is currently waiting (but in principle could cause a "race" where
+    // both the we and the other task observe the "first" IRQ to arrive, while the ISR
+    // triggers again due to this call and sets the `IRQ_EVENT_GOT_IRQ` bit again
+    // "supriously"). This corner-case is dealt with by the bit clear performed above---
+    // it can only occur when we make this `gpio_intr_enable()` call after the ISR
+    // has already triggered and disabled itself, but before the other waiting task has
+    // recieved the `IRQ_EVENT_GOT_IRQ` message and cleared the pending bit.
+    gpio_intr_enable(src->pin_irq);
 
-    // Wait until the ISR tells us IRQ has gone high again.
-    while (xSemaphoreTake(task->ctrl.irq_sem, portMAX_DELAY) == pdFALSE)
-        ;
+    // Now wait until the ISR tells us IRQ has gone active again.
+    //
+    // Note that it could have happened that after this `gpio_intr_enable()` call, because
+    // of another wait operation in progress on another thread the ISR had already triggered,
+    // disabled itself, and then sent the `IRQ_EVENT_GOT_IRQ` bit. It is therefore imperative
+    // that the other waiting task does not automatically clear the `IRQ_EVENT_GOT_IRQ` bit
+    // upon its reciept. Else this could occur before we call `xEventGroupWaitBits()` ourselves,
+    // thereby missing the setting of `IRQ_EVENT_GOT_IRQ` which we wanted to observe. This would
+    // then lock up this thread until another thread calls `sleep_until_irq_active()` again.
+    //
+    // As a solution, we simply don't ask FreeRTOS to automatically clear the `IRQ_EVENT_GOT_IRQ`
+    // bit upon its reciept. Instead we perform the relevant bit clear above, before the call to
+    // `gpio_intr_enable()`, which solves all of our propblems.
+    EventBits_t bits;
+    do {
+        bits = xEventGroupWaitBits(src->events,
+                                   (IRQ_EVENT_GOT_IRQ | IRQ_EVENT_SHOULD_TEARDOWN),
+                                   false, false, portMAX_DELAY);
+    } while (!(bits & (IRQ_EVENT_GOT_IRQ | IRQ_EVENT_SHOULD_TEARDOWN)));
 
-    // The concurrency "invariant" at this point is that we are guarenteed that the ISR
-    // handler is disabled.
-}
-
-static void irq_loop(irq_task_t* task) {
-    irq_task_ctrl_t ctrl = task->ctrl;
-
-    while (1) {
-        while (xSemaphoreTake(ctrl.state_mutex, portMAX_DELAY) == pdFALSE)
-            ;
-
-        SemaphoreHandle_t should_stop = task->state.should_stop;
-
-        xSemaphoreGive(ctrl.state_mutex);
-
-        if (should_stop) {
-            ESP_LOGD(TAG, "irq_loop() stopping");
-            xSemaphoreGive(should_stop);
-            return;
-        }
-
-        sleep_until_irq_high(task);
-
-        ctrl.handle_irq(ctrl.private);
-    }
+    return !(bits & IRQ_EVENT_SHOULD_TEARDOWN);
 }
 
 static void irq_task(void* arg) {
-    irq_task_t* task = arg;
+    libirq_source_t* src = arg;
 
-    gpio_num_t pin_irq = task->ctrl.pin_irq;
+    gpio_num_t pin_irq = src->pin_irq;
 
     gpio_config_t io_conf = {
-        .intr_type = task->ctrl.trigger_high ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL,
+        .intr_type = src->trigger_high ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL,
         .mode = GPIO_MODE_INPUT,
         .pin_bit_mask = (1ULL << pin_irq),
         .pull_down_en = 0,
@@ -154,11 +153,14 @@ static void irq_task(void* arg) {
     // (Note that we need `gpio_install_isr_service()` to have been
     // called without the flag which requires IRAM ISRs.)
     gpio_install_isr_service(0);
-    gpio_isr_handler_add(pin_irq, isr_irq, task);
+    gpio_isr_handler_add(pin_irq, isr_irq, src);
 
-    irq_loop(task);
-
-    ESP_ERROR_CHECK(util_stack_overflow_check());
+    EventBits_t bits;
+    do {
+        bits = xEventGroupWaitBits(src->events,
+                                   IRQ_EVENT_SHOULD_TEARDOWN,
+                                   false, false, portMAX_DELAY);
+    } while (!(bits & IRQ_EVENT_SHOULD_TEARDOWN));
 
     io_conf.intr_type = GPIO_INTR_DISABLE;
     ESP_ERROR_CHECK(gpio_config(&io_conf));
@@ -168,65 +170,119 @@ static void irq_task(void* arg) {
 
     gpio_intr_enable(pin_irq);
 
-    free_irq_task(task);
-
     ESP_LOGD(TAG, "irq task stopped");
+
+    xEventGroupSetBits(src->events, IRQ_EVENT_TEARDOWN_FINISHED);
 }
 
-esp_err_t libirq_create(gpio_num_t pin_irq, bool trigger_high, handle_irq_fn_t handle_irq, void* private,
-                        BaseType_t core_id, uint32_t task_stack_size, irq_task_handle_t* out_handle) {
-    irq_task_t* task = alloc_irq_task(pin_irq, trigger_high, handle_irq, private);
+esp_err_t libirq_source_create(gpio_num_t pin_irq, bool trigger_high, BaseType_t core_id,
+                               libirq_source_handle_t* out_handle) {
+    libirq_source_t* src = alloc_irq_source(pin_irq, trigger_high);
 
     // Note that this task will allocate an interrupt, and therefore must happen on a well-defined core
     // (hence `xTaskCreatePinnedToCore()`), since interrupts must be deallocated on the same core they
     // were allocated on.
-    BaseType_t result = xTaskCreatePinnedToCore(&irq_task, "irq_task", task_stack_size, (void*) task,
-                                                10, NULL, core_id);
+    //
+    // After allocating the interrupt the task will put itself to sleep, only to awake when it is time
+    // for the interrupt to be deallocated.
+    BaseType_t result = xTaskCreatePinnedToCore(&irq_task, "libirq_task", IRQ_TASK_STACK_SIZE, (void*) src,
+                                                IRQ_TASK_PRIORITY, NULL, core_id);
     if (result != pdPASS) {
-        free_irq_task(task);
+        free_irq_source(src);
 
         ESP_LOGE(TAG, "failed to create irq task! (0x%X)", result);
         return ESP_FAIL;
     }
 
-    ESP_LOGD(TAG, "created irq task: %p", task);
+    ESP_LOGD(TAG, "%s: %p", __func__, src);
 
-    *out_handle = task;
+    *out_handle = src;
     return ESP_OK;
 }
 
-void libirq_wake(irq_task_handle_t task) {
-    xSemaphoreGive(task->ctrl.irq_sem);
+void libirq_source_trigger(libirq_source_handle_t handle) {
+    xEventGroupSetBits(handle->events, IRQ_EVENT_GOT_IRQ);
 }
 
-void libirq_destroy(irq_task_handle_t task) {
-    ESP_LOGD(TAG, "destroying irq task: %p", task);
+void libirq_source_destroy(libirq_source_handle_t handle) {
+    ESP_LOGD(TAG, "%s: %p", __func__, handle);
 
-    // Because the irq task keeps a pointer to itself, at this point all we need to do is
-    // to signal to the player task to stop, and wait for that to be acknowledged.
-    SemaphoreHandle_t should_stop = xSemaphoreCreateBinary();
+    xEventGroupSetBits(handle->events, IRQ_EVENT_SHOULD_TEARDOWN);
 
-    // Take the state mutex.
-    while (xSemaphoreTake(task->ctrl.state_mutex, portMAX_DELAY) == pdFALSE)
-        ;
+    EventBits_t bits;
+    do {
+        bits = xEventGroupWaitBits(handle->events,
+                                   IRQ_EVENT_SHOULD_TEARDOWN,
+                                   false, false, portMAX_DELAY);
+    } while (!(bits & IRQ_EVENT_TEARDOWN_FINISHED));
 
-    // The `should_stop` signal can only be sent once, and no further
-    // updates are then permitted. (Because allowing such would both
-    // be useless in practice and also would create a race condition.)
-    assert(!task->state.should_stop);
-    task->state.should_stop = should_stop;
+    dec_refcount_irq_source(handle);
+}
 
-    // Give the state mutex.
-    xSemaphoreGive(task->ctrl.state_mutex);
+libirq_waiter_t libirq_waiter_create(libirq_source_handle_t handle) {
+    // It is a race condition to create waiters after the source has been destroyed.
+    // Also, this is pointless.
+    assert(!(xEventGroupGetBits(handle->events) & IRQ_EVENT_SHOULD_TEARDOWN));
 
-    // Wake the task if it is sleeping.
-    libirq_wake(task);
+    libirq_waiter_t waiter = {
+        .__internal = handle,
+    };
+    inc_refcount_irq_source(handle);
+    return waiter;
+}
 
-    // Wait for the signal that stopping has sufficiently completed (in that
-    // `handle_irq()` will no longer be called).
-    while (xSemaphoreTake(should_stop, portMAX_DELAY) == pdFALSE)
-        ;
+void libirq_waiter_destroy(libirq_waiter_t waiter) {
+    dec_refcount_irq_source(waiter.__internal);
+}
 
-    // Free the signally semaphore.
-    vSemaphoreDelete(should_stop);
+bool libirq_waiter_sleep_until_active(libirq_waiter_t waiter) {
+    bool should_destroy = !sleep_until_irq_active(waiter.__internal);
+
+    if (should_destroy) {
+        libirq_waiter_destroy(waiter);
+    }
+
+    return !should_destroy;
+}
+
+typedef struct waiter_loop_data {
+    libirq_waiter_t waiter;
+
+    libtask_do_once_fn_t do_once;
+    void* private;
+} waiter_loop_data_t;
+
+static libtask_disposition_t libirq_do_once_wrapper(waiter_loop_data_t* data) {
+    if (!libirq_waiter_sleep_until_active(data->waiter)) {
+        free(data);
+        return LIBTASK_DISPOSITION_STOP;
+    }
+
+    libtask_disposition_t disp = data->do_once(data->private);
+
+    if (disp == LIBTASK_DISPOSITION_STOP) {
+        libirq_waiter_destroy(data->waiter);
+        free(data);
+    }
+
+    return disp;
+}
+
+esp_err_t libirq_managed_loop_spawn(libirq_waiter_t waiter,
+                                    libtask_do_once_fn_t do_once, void* private,
+                                    const char* name, uint32_t task_stack_size, UBaseType_t task_priority,
+                                    libtask_loop_handle_t* out_handle) {
+    waiter_loop_data_t* data = malloc(sizeof(waiter_loop_data_t));
+    data->waiter = waiter;
+    data->do_once = do_once;
+    data->private = private;
+
+    esp_err_t ret = libtask_loop_spawn((libtask_do_once_fn_t) libirq_do_once_wrapper, data, name, task_stack_size, task_priority, out_handle);
+
+    if (ret != ESP_OK) {
+        libirq_waiter_destroy(waiter);
+        free(data);
+    }
+
+    return ret;
 }
